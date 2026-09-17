@@ -1,0 +1,223 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0b">
+  <title>SQUEEZE AI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#0b0b0b;color:#f4f4f4;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;min-height:100vh;display:grid;place-items:center}
+    .app{width:min(520px,92vw);padding:28px 22px;text-align:center}
+    h1{font-size:42px;margin:0 0 8px;font-weight:800;letter-spacing:-2px}
+    .sub{opacity:.65;margin-bottom:28px}
+    button{width:100%;padding:16px;border:0;border-radius:16px;font-size:18px;font-weight:700;background:#fff;color:#111}
+    button:disabled{opacity:.35}
+    .status{margin:20px 0;padding:16px;border:1px solid #292929;border-radius:16px;background:#121212;min-height:58px}
+    .answer{margin-top:14px;text-align:left;padding:18px;border-radius:16px;background:#141414;white-space:pre-wrap;line-height:1.45;min-height:70px}
+    .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#777;margin-right:7px}
+    .ok{background:#72ff9d}.warn{background:#ffd166}
+    small{opacity:.5;display:block;margin-top:18px;line-height:1.4}
+  </style>
+</head>
+<body>
+<div class="app">
+  <h1>SQUEEZE AI</h1>
+  <div class="sub">Secure phone microphone bridge</div>
+  <button id="connect">Connect SQUEEZE</button>
+  <div class="status" id="status"><span class="dot"></span>Not connected</div>
+  <div class="answer" id="answer">4 taps on the ESP32 will start AI listening.</div>
+  <small>This page must be opened from HTTPS. Chrome/Android Web Bluetooth support is required.</small>
+</div>
+<script>
+const SERVICE = '7B2F0001-9E2A-4A7A-9C3B-6B8F2D7E1001';
+const TRIGGER = '7B2F0002-9E2A-4A7A-9C3B-6B8F2D7E1001';
+const AUDIO_RX = '7B2F0003-9E2A-4A7A-9C3B-6B8F2D7E1001';
+
+const connectBtn = document.getElementById('connect');
+const statusEl = document.getElementById('status');
+const answerEl = document.getElementById('answer');
+
+let device = null;
+let triggerChar = null;
+let audioChar = null;
+let permissionStream = null;
+let recording = false;
+let recorder = null;
+let chunks = [];
+let recordTimer = null;
+const MAX_RECORD_MS = 8000;
+
+function setStatus(text, good=false, warn=false){
+  statusEl.innerHTML = `<span class="dot ${good?'ok':warn?'warn':''}"></span>${text}`;
+}
+
+function supportedMime(){
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4'
+  ];
+  for(const t of types){
+    if(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+async function requestMicPermission(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    throw new Error('Microphone API unavailable. Open this page over HTTPS.');
+  }
+  const s = await navigator.mediaDevices.getUserMedia({audio:true});
+  s.getTracks().forEach(t=>t.stop());
+}
+
+async function connect(){
+  if(!window.isSecureContext) throw new Error('This page is not a secure context. Use HTTPS.');
+  if(!navigator.bluetooth) throw new Error('Web Bluetooth is unavailable in this browser.');
+
+  setStatus('Choose SQUEEZE…');
+  device = await navigator.bluetooth.requestDevice({
+    filters:[{services:[SERVICE]}],
+    optionalServices:[SERVICE]
+  });
+  device.addEventListener('gattserverdisconnected', ()=>{
+    setStatus('Disconnected', false, true);
+    triggerChar = null;
+    audioChar = null;
+  });
+
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE);
+  triggerChar = await service.getCharacteristic(TRIGGER);
+  audioChar = await service.getCharacteristic(AUDIO_RX);
+
+  await triggerChar.startNotifications();
+  triggerChar.addEventListener('characteristicvaluechanged', onTrigger);
+
+  // Ask for mic permission from a real user gesture while connecting.
+  await requestMicPermission();
+
+  setStatus('Connected • waiting for 4 taps', true);
+  answerEl.textContent = 'Ready. Tap the ESP32 touch sensor 4 times.';
+}
+
+async function onTrigger(event){
+  const value = new TextDecoder().decode(event.target.value);
+  if(value !== 'AI4' || recording) return;
+  await startRecording();
+}
+
+function startRecording(){
+  return new Promise(async (resolve,reject)=>{
+    try{
+      if(!audioChar) throw new Error('SQUEEZE is not connected.');
+      if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('Microphone API unavailable.');
+
+      const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+      const mime = supportedMime();
+      recorder = mime ? new MediaRecorder(stream,{mimeType:mime}) : new MediaRecorder(stream);
+      chunks = [];
+      recording = true;
+      setStatus('LISTENING… speak now', true);
+      answerEl.textContent = 'Recording for up to 8 seconds…';
+
+      recorder.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
+      recorder.onerror = e => {
+        stream.getTracks().forEach(t=>t.stop());
+        recording = false;
+        reject(e.error || new Error('Recorder error'));
+      };
+      recorder.onstop = async ()=>{
+        clearTimeout(recordTimer);
+        stream.getTracks().forEach(t=>t.stop());
+        recording = false;
+        try{
+          setStatus('Sending audio…', false, true);
+          const blob = new Blob(chunks,{type:recorder.mimeType || 'audio/webm'});
+          await sendAudio(blob);
+          resolve();
+        }catch(err){
+          setStatus(err.message || 'Audio transfer failed', false, true);
+          answerEl.textContent = 'Try again with another 4-tap.';
+          reject(err);
+        }
+      };
+      recorder.start(250);
+      recordTimer = setTimeout(()=>stopRecording(), MAX_RECORD_MS);
+    }catch(err){
+      recording = false;
+      reject(err);
+      setStatus(err.message || 'Microphone error', false, true);
+    }
+  });
+}
+
+function stopRecording(){
+  if(recorder && recorder.state !== 'inactive') recorder.stop();
+}
+
+async function writeBytes(bytes){
+  if(!audioChar) throw new Error('SQUEEZE disconnected.');
+  if(audioChar.properties && audioChar.properties.writeWithoutResponse && audioChar.writeValueWithoutResponse){
+    await audioChar.writeValueWithoutResponse(bytes);
+  }else{
+    await audioChar.writeValueWithResponse(bytes);
+  }
+}
+
+async function sendAudio(blob){
+  const buffer = new Uint8Array(await blob.arrayBuffer());
+  if(buffer.length === 0) throw new Error('No microphone audio was captured.');
+  if(buffer.length > 35000) throw new Error('Audio is too large. Keep it under 8 seconds.');
+
+  // START: 0x01 + 32-bit little-endian length
+  const start = new Uint8Array(5);
+  start[0] = 0x01;
+  const dv = new DataView(start.buffer);
+  dv.setUint32(1, buffer.length, true);
+  await writeBytes(start);
+
+  // 180-byte chunks normally work after MTU negotiation. If the browser rejects
+  // a large packet, retry the whole transfer with 19-byte legacy BLE chunks.
+  try{
+    await sendDataChunks(buffer,180);
+  }catch(firstErr){
+    await sendDataChunks(buffer,19);
+  }
+
+  await writeBytes(new Uint8Array([0x03]));
+  setStatus('Sent • waiting for SQUEEZE', true);
+  answerEl.textContent = 'SQUEEZE is transcribing and thinking…';
+}
+
+async function sendDataChunks(buffer, chunkSize){
+  // If a large-chunk attempt fails, restart with a fresh START frame so the ESP32
+  // discards the partial transfer.
+  if(chunkSize === 19){
+    const start = new Uint8Array(5);
+    start[0] = 0x01;
+    new DataView(start.buffer).setUint32(1, buffer.length, true);
+    await writeBytes(start);
+  }
+
+  for(let offset=0; offset<buffer.length; offset+=chunkSize){
+    const n = Math.min(chunkSize,buffer.length-offset);
+    const packet = new Uint8Array(n+1);
+    packet[0] = 0x02;
+    packet.set(buffer.subarray(offset,offset+n),1);
+    await writeBytes(packet);
+  }
+}
+
+connectBtn.addEventListener('click', async ()=>{
+  connectBtn.disabled = true;
+  try{
+    await connect();
+  }catch(err){
+    setStatus(err.message || 'Connection failed', false, true);
+    connectBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
